@@ -1,0 +1,30 @@
+name: build-ipk
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install validators
+        run: sudo apt-get update && sudo apt-get install -y lua5.1
+      - name: Validate shell scripts
+        run: sh -n package/data/etc/init.d/gl_fanctrl package/data/usr/sbin/gl-fanctrl-daemon package/data/usr/share/fanctrl/fanctrl-common.sh package/control/postinst package/control/prerm package/control/postrm scripts/build-ipk.sh
+      - name: Validate Lua files
+        run: lua5.1 -e "assert(loadfile('package/data/usr/share/gl-validator.d/fanctrl.lua'))" && lua5.1 -e "assert(loadfile('package/data/usr/lib/oui-httpd/rpc/fanctrl'))"
+      - name: Build package
+        run: npm run build:ipk
+      - name: Check package contents
+        run: npm run check:ipk
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-fanctrl-ipk
+          path: dist/*.ipk

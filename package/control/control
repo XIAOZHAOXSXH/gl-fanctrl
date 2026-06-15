@@ -1,0 +1,10 @@
+Package: gl-fanctrl
+Version: 0.1.0
+Architecture: all
+Maintainer: XIAOZHAOXSXH
+Section: utils
+Priority: optional
+Depends: libc, uci, lua, gl-sdk4-ui-core
+Description: PWM fan control plugin for GL.iNet SDK4 UI.
+ Provides a native GL.iNet SDK4 UI page and RPC service for safe PWM fan
+ control on GL-MT3000-class devices.

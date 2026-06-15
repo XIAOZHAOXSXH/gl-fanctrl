@@ -1,0 +1,14 @@
+{
+  "name": "gl-fanctrl",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Native GL.iNet SDK4 UI PWM fan control plugin for portable routers.",
+  "author": "XIAOZHAOXSXH",
+  "scripts": {
+    "build:ui": "node src/ui/build.js",
+    "build:ipk": "node scripts/build-ipk.js",
+    "check:ipk": "node scripts/check-ipk.js",
+    "lint:shell": "sh -n package/data/etc/init.d/gl_fanctrl package/data/usr/sbin/gl-fanctrl-daemon package/data/usr/share/fanctrl/fanctrl-common.sh",
+    "lint:lua": "lua5.1 -e \"assert(loadfile('package/data/usr/share/gl-validator.d/fanctrl.lua'))\" && lua5.1 -e \"assert(loadfile('package/data/usr/lib/oui-httpd/rpc/fanctrl'))\""
+  }
+}

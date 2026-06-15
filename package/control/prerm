@@ -1,0 +1,5 @@
+#!/bin/sh
+
+[ -x /etc/init.d/gl_fanctrl ] && /etc/init.d/gl_fanctrl stop >/dev/null 2>&1 || true
+
+exit 0

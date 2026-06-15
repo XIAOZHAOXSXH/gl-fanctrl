@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+
+[ -x /etc/init.d/gl_fanctrl ] && /etc/init.d/gl_fanctrl enable >/dev/null 2>&1 || true
+[ -x /etc/init.d/nginx ] && /etc/init.d/nginx restart >/dev/null 2>&1 && sleep 1 || true
+
+exit 0

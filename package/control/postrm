@@ -1,0 +1,6 @@
+#!/bin/sh
+
+[ -x /etc/init.d/gl_fan ] && /etc/init.d/gl_fan restart >/dev/null 2>&1 || true
+[ -x /etc/init.d/nginx ] && /etc/init.d/nginx restart >/dev/null 2>&1 && sleep 1 || true
+
+exit 0

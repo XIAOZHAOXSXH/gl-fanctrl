@@ -1,0 +1,115 @@
+#!/bin/sh
+
+. /usr/share/fanctrl/fanctrl-common.sh
+
+calc_auto_percent() {
+	local temp="$1"
+	if [ "$temp" -lt $((start_temp - hysteresis)) ]; then
+		printf '0\n'
+	elif [ "$temp" -ge "$wall_temp" ]; then
+		printf '%s\n' "$max_percent"
+	else
+		local span=$((wall_temp - start_temp))
+		local rise=$((temp - start_temp))
+		[ "$rise" -lt 0 ] && rise=0
+		[ "$span" -le 0 ] && span=1
+		printf '%s\n' $((start_percent + (max_percent - start_percent) * rise / span))
+	fi
+}
+
+apply_manual_file() {
+	if [ -s "$MANUAL_FILE" ]; then
+		local p
+		p="$(read_first_line "$MANUAL_FILE")"
+		manual_percent="$(clamp_int "$p" 0 100)"
+	fi
+}
+
+cleanup() {
+	[ -n "$cooling" ] && write_pwm_percent "$cooling" 0 >/dev/null 2>&1 || true
+	rm -f "$PID_FILE"
+	start_official_fan
+}
+
+soft_stop() {
+	[ -n "$cooling" ] && write_pwm_percent "$cooling" 0 >/dev/null 2>&1 || true
+	rm -f "$PID_FILE"
+}
+
+main() {
+	ensure_run_dir
+	echo $$ > "$PID_FILE"
+
+	local temp_path cooling hwmon fail_count=0 temp percent rpm pwm status
+	temp_path="$(get_temp_path)" || {
+		status_write "unsupported:no-temperature"
+		log_msg "no readable temperature sensor found"
+		exit 1
+	}
+	cooling="$(get_cooling_device)" || {
+		status_write "unsupported:no-cooling-device"
+		log_msg "no writable pwm cooling device found"
+		exit 1
+	}
+	hwmon="$(get_hwmon_dir || true)"
+
+	stop_official_fan
+	status_write "running"
+	log_msg "started with temp=$temp_path cooling=$cooling hwmon=${hwmon:-none}"
+
+	trap 'soft_stop; exit 0' INT TERM
+
+	while :; do
+		load_config
+		if [ "$enabled" != "1" ]; then
+			status_write "disabled"
+			write_pwm_percent "$cooling" 0 || true
+			start_official_fan
+			rm -f "$PID_FILE"
+			exit 0
+		fi
+
+		temp="$(read_temperature_c "$temp_path")"
+		if [ -z "$temp" ]; then
+			fail_count=$((fail_count + 1))
+		else
+			fail_count=0
+		fi
+
+		if [ "$fail_count" -ge 3 ]; then
+			percent="$max_percent"
+			status="safe:temperature-read-failed"
+		elif [ -n "$temp" ] && [ "$temp" -ge "$critical_temp" ]; then
+			percent="$max_percent"
+			status="safe:critical-temperature"
+		elif [ "$mode" = "manual" ]; then
+			apply_manual_file
+			if [ "$manual_percent" -eq 0 ]; then
+				percent=0
+			else
+				percent="$manual_percent"
+				[ "$percent" -lt "$start_percent" ] && percent="$start_percent"
+				[ "$percent" -gt "$max_percent" ] && percent="$max_percent"
+			fi
+			status="manual"
+		else
+			percent="$(calc_auto_percent "$temp")"
+			status="auto"
+		fi
+		percent="$(clamp_int "$percent" 0 "$max_percent")"
+
+		if ! write_pwm_percent "$cooling" "$percent"; then
+			status_write "error:pwm-write-failed"
+			log_msg "pwm write failed, restoring official fan service"
+			cleanup
+			exit 1
+		fi
+
+		rpm="$(read_rpm "$hwmon")"
+		pwm="$(read_pwm_state "$cooling")"
+		status_write "status=$status temperature=${temp:-unknown} pwm=$pwm target=$percent rpm=$rpm"
+		sleep "$poll_interval"
+	done
+}
+
+main "$@"

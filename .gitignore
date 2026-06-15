@@ -1,0 +1,33 @@
+# Build outputs
+dist/
+.pkgstage/
+.ipkbuild/
+*.ipk
+Packages.gz
+Packages-*.gz
+
+# Generated UI bundle
+package/data/www/views/*.gz
+
+# Local checks and screenshots
+.archeck/
+officialcheck/
+output/
+
+# Dependencies and package-manager noise
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local environment files
+.env
+.env.*

@@ -1,0 +1,370 @@
+--[[
+    @object-name: fanctrl
+    @object-desc: Safe PWM fan control for GL.iNet SDK4 UI.
+--]]
+
+local uci = require "uci"
+local utils = require "oui.utils"
+local fs = require "oui.fs"
+
+local M = {}
+local CONFIG = "gl_fanctrl"
+local SECTION = "globals"
+local RUN_DIR = "/var/run/gl-fanctrl"
+local PID_FILE = RUN_DIR .. "/daemon.pid"
+local STATE_FILE = RUN_DIR .. "/state"
+local MANUAL_FILE = RUN_DIR .. "/manual_percent"
+
+local defaults = {
+    enabled = 0,
+    mode = "auto",
+    start_temp = 70,
+    wall_temp = 76,
+    critical_temp = 88,
+    hysteresis = 3,
+    start_percent = 35,
+    max_percent = 100,
+    manual_percent = 0,
+    poll_interval = 2
+}
+
+local function readfile(path, fmt)
+    return utils.readfile(path, fmt)
+end
+
+local function writefile(path, data)
+    return utils.writefile(path, data)
+end
+
+local function trim(s)
+    if not s then return nil end
+    return tostring(s):match("^%s*(.-)%s*$")
+end
+
+local function to_int(value, fallback)
+    local n = tonumber(value)
+    if not n then return fallback end
+    return math.floor(n)
+end
+
+local function clamp(value, min, max)
+    value = to_int(value, min)
+    if value < min then return min end
+    if value > max then return max end
+    return value
+end
+
+local function bool_to_enabled(value)
+    if value == true or value == 1 or value == "1" then return 1 end
+    return 0
+end
+
+local function command(args)
+    local proc, err = ngx.pipe.spawn(args, { stdout_read_timeout = 15000, merge_stderr = true })
+    if not proc then return false, err end
+    proc:wait()
+    return true
+end
+
+local function ensure_run_dir()
+    command({ "mkdir", "-p", RUN_DIR })
+end
+
+local function foreach_dir(path)
+    local items = {}
+    if not fs.access(path) then return items end
+    for name in fs.dir(path) do
+        if name ~= "." and name ~= ".." then
+            items[#items + 1] = name
+        end
+    end
+    return items
+end
+
+local function first_line(path)
+    return trim(readfile(path, "l"))
+end
+
+local function get_temp_path()
+    local hint = first_line("/proc/gl-hw-info/temperature")
+    if hint and fs.access(hint) then return hint end
+
+    for _, name in ipairs(foreach_dir("/sys/class/thermal")) do
+        if name:match("^thermal_zone%d+$") then
+            local path = "/sys/class/thermal/" .. name .. "/temp"
+            if fs.access(path) then return path end
+        end
+    end
+    return nil
+end
+
+local function get_fan_hints()
+    local hints = {}
+    local text = first_line("/proc/gl-hw-info/fan")
+    if not text then return hints end
+    for item in text:gmatch("%S+") do
+        hints[#hints + 1] = item
+    end
+    return hints
+end
+
+local function get_cooling_device()
+    for _, hint in ipairs(get_fan_hints()) do
+        if hint:match("^cooling_device%d+$") then
+            local path = "/sys/class/thermal/" .. hint
+            if fs.access(path .. "/cur_state") then return path end
+        end
+    end
+
+    for _, name in ipairs(foreach_dir("/sys/class/thermal")) do
+        if name:match("^cooling_device%d+$") then
+            local path = "/sys/class/thermal/" .. name
+            if first_line(path .. "/type") == "pwm-fan" and fs.access(path .. "/cur_state") then
+                return path
+            end
+        end
+    end
+    return nil
+end
+
+local function get_hwmon_dir()
+    for _, hint in ipairs(get_fan_hints()) do
+        if hint:match("^hwmon%d+$") then
+            local path = "/sys/class/hwmon/" .. hint
+            if fs.access(path) then return path end
+        end
+    end
+
+    for _, name in ipairs(foreach_dir("/sys/class/hwmon")) do
+        if name:match("^hwmon%d+$") then
+            local path = "/sys/class/hwmon/" .. name
+            if first_line(path .. "/name") == "pwmfan" then return path end
+        end
+    end
+    return nil
+end
+
+local function read_temperature(path)
+    local raw = to_int(first_line(path), nil)
+    if not raw then return nil end
+    if raw >= 1000 then return math.floor(raw / 1000) end
+    return raw
+end
+
+local function read_rpm(hwmon)
+    if not hwmon then return 0 end
+    return to_int(first_line(hwmon .. "/fan1_input"), 0)
+end
+
+local function read_pwm(cooling)
+    if not cooling then return 0, 0, 255 end
+    local cur = to_int(first_line(cooling .. "/cur_state"), 0)
+    local max = to_int(first_line(cooling .. "/max_state"), 255)
+    if max <= 0 then max = 255 end
+    return math.floor(cur * 100 / max), cur, max
+end
+
+local function percent_to_state(percent, max)
+    percent = clamp(percent, 0, 100)
+    max = to_int(max, 255)
+    if max <= 0 then max = 255 end
+    return math.floor(percent * max / 100)
+end
+
+local function read_runtime_manual_percent()
+    local value = to_int(first_line(MANUAL_FILE), nil)
+    if not value then return nil end
+    return clamp(value, 0, 100)
+end
+
+local function manual_target_percent(cfg, temp)
+    local max_percent = clamp(cfg.max_percent, 0, 100)
+    if not temp or temp >= cfg.critical_temp then
+        return max_percent
+    end
+    if cfg.manual_percent <= 0 then
+        return 0
+    end
+    local target = clamp(cfg.manual_percent, 0, max_percent)
+    if target > 0 and target < cfg.start_percent then
+        target = cfg.start_percent
+    end
+    if target > max_percent then
+        target = max_percent
+    end
+    return target
+end
+
+local function write_pwm_percent(cooling, percent)
+    if not cooling or not fs.access(cooling .. "/cur_state") then return false end
+    percent = clamp(percent, 0, 100)
+    local max = to_int(first_line(cooling .. "/max_state"), 255)
+    local state = percent_to_state(percent, max)
+    writefile(cooling .. "/cur_state", tostring(state))
+    return true
+end
+
+local function apply_manual_now(cfg)
+    local cooling = get_cooling_device()
+    if not cooling then return false end
+    local temp_path = get_temp_path()
+    local temp = temp_path and read_temperature(temp_path) or nil
+    local target = manual_target_percent(cfg, temp)
+    return write_pwm_percent(cooling, target)
+end
+
+local function pid_running(path)
+    local pid = to_int(first_line(path), nil)
+    if not pid then return false end
+    return fs.access("/proc/" .. pid)
+end
+
+local function process_running(pattern)
+    local proc, err = ngx.pipe.spawn({ "pgrep", "-f", pattern }, { stdout_read_timeout = 3000 })
+    if not proc then return false end
+    local out = proc:read_all() or ""
+    return out:match("%d+") ~= nil
+end
+
+local function ensure_config(c)
+    if not c:get(CONFIG, SECTION) then
+        c:section(CONFIG, "globals", SECTION, {})
+    end
+end
+
+local function get_config()
+    local c = uci.cursor()
+    ensure_config(c)
+    return {
+        enabled = bool_to_enabled(c:get(CONFIG, SECTION, "enabled") or defaults.enabled),
+        mode = c:get(CONFIG, SECTION, "mode") or defaults.mode,
+        start_temp = clamp(c:get(CONFIG, SECTION, "start_temp") or defaults.start_temp, 35, 85),
+        wall_temp = clamp(c:get(CONFIG, SECTION, "wall_temp") or defaults.wall_temp, 40, 95),
+        critical_temp = clamp(c:get(CONFIG, SECTION, "critical_temp") or defaults.critical_temp, 43, 105),
+        hysteresis = clamp(c:get(CONFIG, SECTION, "hysteresis") or defaults.hysteresis, 1, 10),
+        start_percent = clamp(c:get(CONFIG, SECTION, "start_percent") or defaults.start_percent, 0, 100),
+        max_percent = clamp(c:get(CONFIG, SECTION, "max_percent") or defaults.max_percent, 0, 100),
+        manual_percent = clamp(c:get(CONFIG, SECTION, "manual_percent") or defaults.manual_percent, 0, 100),
+        poll_interval = clamp(c:get(CONFIG, SECTION, "poll_interval") or defaults.poll_interval, 1, 30)
+    }
+end
+
+local function normalize_config(cfg)
+    cfg.enabled = bool_to_enabled(cfg.enabled)
+    if cfg.mode ~= "manual" then cfg.mode = "auto" end
+    cfg.start_temp = clamp(cfg.start_temp, 35, 85)
+    cfg.wall_temp = clamp(cfg.wall_temp, 40, 95)
+    if cfg.wall_temp < cfg.start_temp + 5 then cfg.wall_temp = cfg.start_temp + 5 end
+    if cfg.wall_temp > 95 then cfg.wall_temp = 95 end
+    cfg.critical_temp = clamp(cfg.critical_temp, 43, 105)
+    if cfg.critical_temp < cfg.wall_temp + 3 then cfg.critical_temp = cfg.wall_temp + 3 end
+    if cfg.critical_temp > 105 then cfg.critical_temp = 105 end
+    cfg.hysteresis = clamp(cfg.hysteresis, 1, 10)
+    cfg.start_percent = clamp(cfg.start_percent, 0, 100)
+    cfg.max_percent = clamp(cfg.max_percent, 0, 100)
+    if cfg.max_percent < cfg.start_percent then cfg.max_percent = cfg.start_percent end
+    cfg.manual_percent = clamp(cfg.manual_percent, 0, 100)
+    cfg.poll_interval = clamp(cfg.poll_interval, 1, 30)
+    return cfg
+end
+
+local function save_config(cfg)
+    local c = uci.cursor()
+    ensure_config(c)
+    cfg = normalize_config(cfg)
+    for key, value in pairs(cfg) do
+        c:set(CONFIG, SECTION, key, tostring(value))
+    end
+    c:commit(CONFIG)
+    return cfg
+end
+
+local function restart_service(enabled)
+    if enabled == 1 then
+        command({ "/etc/init.d/gl_fanctrl", "stop" })
+        return command({ "/etc/init.d/gl_fanctrl", "start" })
+    end
+    return command({ "/etc/init.d/gl_fanctrl", "stop" })
+end
+
+M.get_status = function()
+    local temp_path = get_temp_path()
+    local cooling = get_cooling_device()
+    local hwmon = get_hwmon_dir()
+    local config = normalize_config(get_config())
+    local runtime_manual_percent = read_runtime_manual_percent()
+    if config.mode == "manual" and runtime_manual_percent ~= nil then
+        config.manual_percent = runtime_manual_percent
+    end
+    local pwm_percent, pwm_state, pwm_max = read_pwm(cooling)
+    local supported = temp_path ~= nil and cooling ~= nil
+
+    local plugin_running = pid_running(PID_FILE) or process_running("gl-fanctrl-daemon")
+
+    return {
+        supported = supported,
+        model = first_line("/proc/gl-hw-info/model") or "",
+        temp_path = temp_path or "",
+        cooling_path = cooling or "",
+        hwmon_path = hwmon or "",
+        temperature = temp_path and read_temperature(temp_path) or nil,
+        rpm = read_rpm(hwmon),
+        pwm = pwm_percent,
+        pwm_state = pwm_state,
+        pwm_max = pwm_max,
+        official_running = process_running("/usr/bin/gl_fan"),
+        plugin_running = plugin_running,
+        takeover = config.enabled == 1 and plugin_running,
+        state = first_line(STATE_FILE) or "unknown",
+        config = config
+    }
+end
+
+M.set_config = function(params)
+    local cfg = get_config()
+    for key, _ in pairs(defaults) do
+        if params[key] ~= nil then cfg[key] = params[key] end
+    end
+    cfg = save_config(cfg)
+    restart_service(cfg.enabled)
+    return M.get_status()
+end
+
+M.set_manual = function(params)
+    local percent = clamp(params.percent, 0, 100)
+    local persist = params.persist == true
+    local cfg = get_config()
+    local was_enabled = cfg.enabled == 1
+    local was_manual = cfg.mode == "manual"
+    local plugin_running = pid_running(PID_FILE) or process_running("gl-fanctrl-daemon")
+
+    cfg.enabled = 1
+    cfg.mode = "manual"
+    cfg.manual_percent = percent
+
+    ensure_run_dir()
+    writefile(MANUAL_FILE, tostring(percent))
+    writefile(RUN_DIR .. "/apply", tostring(os.time()))
+
+    if persist or not was_enabled or not was_manual then
+        cfg = save_config(cfg)
+    end
+
+    if not was_enabled or not plugin_running then
+        restart_service(cfg.enabled)
+    end
+
+    apply_manual_now(cfg)
+
+    return M.get_status()
+end
+
+M.restore_defaults = function()
+    local cfg = {}
+    for key, value in pairs(defaults) do cfg[key] = value end
+    cfg = save_config(cfg)
+    restart_service(cfg.enabled)
+    return M.get_status()
+end
+
+return M
