@@ -33,16 +33,7 @@ jobs:
         run: sh -n package/data/etc/init.d/gl_fanctrl package/data/usr/sbin/gl-fanctrl-daemon package/data/usr/share/fanctrl/fanctrl-common.sh package/control/postinst package/control/prerm package/control/postrm scripts/build-ipk.sh
       - name: Validate Lua files
         run: lua5.1 -e "assert(loadfile('package/data/usr/share/gl-validator.d/fanctrl.lua'))" && lua5.1 -e "assert(loadfile('package/data/usr/lib/oui-httpd/rpc/fanctrl'))"
-      - name: Build package
-        run: npm run build:ipk
-      - name: Check package contents
-        run: npm run check:ipk
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: gl-fanctrl-ipk
-          path: dist/*.ipk
-      - name: Resolve release tag
+      - name: Resolve release tag & sync package version
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         id: release
         env:
@@ -57,7 +48,19 @@ jobs:
             version="$(node -p "require('./package.json').version")"
             tag="v${version}"
           fi
+          ver_no_v="${tag#v}"
+          node -e "const fs=require('fs');const pkg=require('./package.json');pkg.version='$ver_no_v';fs.writeFileSync('package.json',JSON.stringify(pkg,null,2))"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "pkg_version=$ver_no_v" >> "$GITHUB_OUTPUT"
+      - name: Build package
+        run: npm run build:ipk
+      - name: Check package contents
+        run: npm run check:ipk
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-fanctrl-ipk
+          path: dist/*.ipk
       - name: Upload IPK to GitHub Release
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         env:

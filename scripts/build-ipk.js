@@ -3,8 +3,9 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const root = path.resolve(__dirname, '..');
-const pkgName = 'gl-fanctrl';
-const version = '0.1.0';
+const pkg = require(path.join(root, 'package.json'));
+const pkgName = pkg.name;
+const version = pkg.version;
 const arch = 'all';
 const stage = path.join(root, '.pkgstage');
 const dist = path.join(root, 'dist');
@@ -47,7 +48,11 @@ copyDir(path.join(root, 'package/data'), stage);
 writeExecutable(path.join(root, 'package/control/postinst'), path.join(controlDir, 'postinst'));
 writeExecutable(path.join(root, 'package/control/prerm'), path.join(controlDir, 'prerm'));
 writeExecutable(path.join(root, 'package/control/postrm'), path.join(controlDir, 'postrm'));
-fs.copyFileSync(path.join(root, 'package/control/control'), path.join(controlDir, 'control'));
+const srcControl = path.join(root, 'package/control/control');
+const dstControl = path.join(controlDir, 'control');
+let controlText = fs.readFileSync(srcControl, 'utf8');
+controlText = controlText.replace(/^Version: .+$/m, `Version: ${version}`);
+fs.writeFileSync(dstControl, controlText, 'utf8');
 fs.copyFileSync(path.join(root, 'package/control/conffiles'), path.join(controlDir, 'conffiles'));
 
 const py = String.raw`
