@@ -3,8 +3,9 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const root = path.resolve(__dirname, '..');
-const pkgName = 'gl-fanctrl';
-const version = '0.1.0';
+const pkg = require(path.join(root, 'package.json'));
+const pkgName = pkg.name;
+const version = pkg.version;
 const arch = 'all';
 const stage = path.join(root, '.pkgstage');
 const dist = path.join(root, 'dist');
