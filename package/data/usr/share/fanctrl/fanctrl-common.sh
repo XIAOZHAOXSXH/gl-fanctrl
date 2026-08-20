@@ -125,8 +125,12 @@ get_cooling_device() {
 	return 1
 }
 
+# Pick a hwmon directory that can tell us the fan RPM. Prefer devices whose
+# name is "pwmfan"; fall back to any hwmon that exposes a readable
+# fan*_input file (different boards report different hwmon names: pwmfan,
+# gl_hwmon, mt7986_thermal, ...).
 get_hwmon_dir() {
-	local hint dev d
+	local hint dev d name
 	hint="$(read_first_line /proc/gl-hw-info/fan)"
 	for dev in $hint; do
 		case "$dev" in
@@ -139,13 +143,27 @@ get_hwmon_dir() {
 		esac
 	done
 
+	# Prefer pwmfan-named hwmon first (most OpenWrt PWM fan drivers).
 	for d in /sys/class/hwmon/hwmon*; do
 		[ -d "$d" ] || continue
-		[ "$(read_first_line "$d/name")" = "pwmfan" ] && {
+		name="$(read_first_line "$d/name")"
+		[ "$name" = "pwmfan" ] && {
 			printf '%s\n' "$d"
 			return 0
 		}
 	done
+
+	# Fallback: any hwmon that exposes a fan*_input file. Works on boards
+	# where the hwmon name is not literally "pwmfan" (e.g. MediaTek
+	# thermal drivers or GL.iNet-specific wrappers).
+	for d in /sys/class/hwmon/hwmon*; do
+		[ -d "$d" ] || continue
+		[ -r "$d/fan1_input" ] || [ -r "$d/fan_input" ] || \
+			ls "$d"/fan*_input >/dev/null 2>&1 || continue
+		printf '%s\n' "$d"
+		return 0
+	done
+
 	return 1
 }
 
@@ -185,12 +203,47 @@ read_pwm_state() {
 	printf '%s\n' $((state * 100 / 255))
 }
 
+# Best-effort fan RPM read. Try multiple sources because different boards
+# expose the RPM counter through different files:
+#   1. hwmon fan1_input (the common Linux hwmon path).
+#   2. GL.iNet-specific /proc/gl-hw-info/fan_speed (used on some GL-MT*
+#      devices where hwmon fan*_input is not wired up).
+#   3. Any hwmon fan*_input file on the system (last-resort brute search).
 read_rpm() {
 	local hwmon="$1" rpm
-	[ -n "$hwmon" ] || { printf '0\n'; return 0; }
-	rpm="$(read_first_line "$hwmon/fan1_input")" || rpm=0
-	is_uint "$rpm" || rpm=0
-	printf '%s\n' "$rpm"
+
+	# 1) Primary: hwmon fan1_input.
+	if [ -n "$hwmon" ] && [ -r "$hwmon/fan1_input" ]; then
+		rpm="$(read_first_line "$hwmon/fan1_input")"
+		is_uint "$rpm" || rpm=0
+		printf '%s\n' "$rpm"
+		return 0
+	fi
+
+	# 2) GL.iNet-specific proc path (some devices expose RPM here).
+	if [ -r /proc/gl-hw-info/fan_speed ]; then
+		rpm="$(read_first_line /proc/gl-hw-info/fan_speed)"
+		is_uint "$rpm" || rpm=0
+		printf '%s\n' "$rpm"
+		return 0
+	fi
+
+	# 3) Brute scan of every hwmon device on the system. Avoids missing RPM
+	#    when get_hwmon_dir picked a hwmon without fan1_input but another
+	#    hwmon on the same system has it.
+	local d f
+	for d in /sys/class/hwmon/hwmon*; do
+		[ -d "$d" ] || continue
+		for f in "$d"/fan*_input; do
+			[ -r "$f" ] || continue
+			rpm="$(read_first_line "$f")"
+			is_uint "$rpm" || rpm=0
+			[ "$rpm" -gt 0 ] && { printf '%s\n' "$rpm"; return 0; }
+		done
+	done
+
+	printf '0\n'
+	return 0
 }
 
 percent_to_state() {

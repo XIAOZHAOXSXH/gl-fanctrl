@@ -1,0 +1,150 @@
+name: build
+on:
+  push:
+    branches: ["**"]
+    tags: ["V*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag. Leave empty to use package.json version."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark the release as a prerelease."
+        required: false
+        default: false
+        type: boolean
+jobs:
+  build-ipk:
+    name: build-ipk (opkg / OpenWrt 21-22)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install validators
+        run: sudo apt-get update && sudo apt-get install -y lua5.1
+      - name: Validate shell scripts
+        run: sh -n package/data/etc/init.d/gl_fanctrl package/data/usr/sbin/gl-fanctrl-daemon package/data/usr/share/fanctrl/fanctrl-common.sh package/control/postinst package/control/prerm package/control/postrm scripts/build-ipk.sh
+      - name: Validate Lua files
+        run: lua5.1 -e "assert(loadfile('package/data/usr/share/gl-validator.d/fanctrl.lua'))" && lua5.1 -e "assert(loadfile('package/data/usr/lib/oui-httpd/rpc/fanctrl'))"
+      - name: Resolve release tag & sync package version
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        id: release
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            version="$(node -p "require('./package.json').version")"
+            tag="v${version}"
+          fi
+          ver_no_v="${tag#v}"
+          node -e "const fs=require('fs');const pkg=require('./package.json');pkg.version='$ver_no_v';fs.writeFileSync('package.json',JSON.stringify(pkg,null,2))"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "pkg_version=$ver_no_v" >> "$GITHUB_OUTPUT"
+      - name: Build IPK
+        run: npm run build:ipk
+      - name: Check IPK contents
+        run: npm run check:ipk
+      - name: Upload IPK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-fanctrl-ipk
+          path: dist/*.ipk
+      - name: Upload IPK to GitHub Release
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          PRERELEASE: ${{ github.event.inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          notes="Built from ${GITHUB_SHA}."
+          if [ "${PRERELEASE:-false}" = "true" ]; then
+            pr_flag=--prerelease
+          else
+            pr_flag=
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/*.ipk --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/*.ipk --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes "$notes" ${pr_flag:-} || \
+              gh release upload "$RELEASE_TAG" dist/*.ipk --clobber
+          fi
+  build-apk:
+    name: build-apk (apk-tools v3 / OpenWrt 24.10+/25)
+    runs-on: ubuntu-latest
+    container: alpine:3.23
+    permissions:
+      contents: write
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache nodejs npm git github-cli lua5.1 tar
+      - uses: actions/checkout@v4
+      - name: Validate shell scripts
+        run: sh -n package/data/etc/init.d/gl_fanctrl package/data/usr/sbin/gl-fanctrl-daemon package/data/usr/share/fanctrl/fanctrl-common.sh package/control/postinst package/control/prerm package/control/postrm
+      - name: Validate Lua files
+        run: lua5.1 -e "assert(loadfile('package/data/usr/share/gl-validator.d/fanctrl.lua'))" && lua5.1 -e "assert(loadfile('package/data/usr/lib/oui-httpd/rpc/fanctrl'))"
+      - name: Show toolchain versions
+        run: |
+          node --version
+          apk --version
+      - name: Resolve release tag & sync package version
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        id: release
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            version="$(node -p "require('./package.json').version")"
+            tag="v${version}"
+          fi
+          ver_no_v="${tag#v}"
+          node -e "const fs=require('fs');const pkg=require('./package.json');pkg.version='$ver_no_v';fs.writeFileSync('package.json',JSON.stringify(pkg,null,2))"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "pkg_version=$ver_no_v" >> "$GITHUB_OUTPUT"
+      - name: Build APK
+        run: npm run build:apk
+      - name: Check APK contents
+        run: npm run check:apk
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-fanctrl-apk
+          path: dist/*.apk
+      - name: Upload APK to GitHub Release
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          PRERELEASE: ${{ github.event.inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          notes="Built from ${GITHUB_SHA}."
+          if [ "${PRERELEASE:-false}" = "true" ]; then
+            pr_flag=--prerelease
+          else
+            pr_flag=
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/*.apk --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/*.apk --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes "$notes" ${pr_flag:-} || \
+              gh release upload "$RELEASE_TAG" dist/*.apk --clobber
+          fi
